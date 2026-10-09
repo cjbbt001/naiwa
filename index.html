@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>奶蛙闯关</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    height: 100%;
+    background: #141820;
+    color: #f4f0e4;
+    font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    overflow: hidden;
+    touch-action: none;
+  }
+  #wrap {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+  }
+  canvas {
+    background: #87c8ee;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    width: min(100vw, calc(100vh * 960 / 540));
+    height: auto;
+    max-height: calc(100vh - 108px);
+    border: 3px solid #1b140e;
+    box-shadow: 0 8px 0 #1b140e;
+  }
+  #hint {
+    font-size: 13px;
+    opacity: 0.75;
+    text-align: center;
+    padding: 0 12px;
+  }
+  #pad {
+    display: none;
+    width: min(100vw, 960px);
+    padding: 6px 10px 12px;
+    gap: 10px;
+    justify-content: space-between;
+    align-items: center;
+    user-select: none;
+  }
+  .keys { display: flex; gap: 8px; }
+  button.k {
+    width: 64px;
+    height: 64px;
+    border: 3px solid #1b140e;
+    background: #f2c14e;
+    color: #1b140e;
+    font-size: 22px;
+    font-weight: 800;
+    border-radius: 12px;
+    box-shadow: 0 4px 0 #1b140e;
+  }
+  button.k.fire { background: #ef5b5b; color: white; width: 88px; }
+  button.k:active { transform: translateY(3px); box-shadow: 0 1px 0 #1b140e; }
+  @media (pointer: coarse), (max-width: 800px) {
+    #pad { display: flex; }
+    #hint { display: none; }
+    canvas { max-height: calc(100vh - 120px); }
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c" width="960" height="540"></canvas>
+  <div id="hint">方向键或 A/D 移动，W / ↑ / 空格跳跃，J 或 K 射奶。手机用屏幕按钮。</div>
+  <div id="pad">
+    <div class="keys">
+      <button class="k" id="btnL" type="button">←</button>
+      <button class="k" id="btnR" type="button">→</button>
+    </div>
+    <div class="keys">
+      <button class="k" id="btnJ" type="button">跳</button>
+      <button class="k fire" id="btnF" type="button">射</button>
+    </div>
+  </div>
+</div>
+<script>
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+ctx.imageSmoothingEnabled = false;
+
+const W = 960, H = 540;
+const TILE = 32;
+const keys = {};
+const hold = { left: false, right: false, jump: false, fire: false };
+
+const img = {};
+const names = ["frog_idle","frog_walk","frog_shoot","frog_hurt","bullet","slime","bat0","bat1","boss","boss_bullet","ground","brick","plat","heart","cloud","milk"];
+let loaded = 0;
+names.forEach(n => {
+  const i = new Image();
+  i.src = "assets/" + n + ".png";
+  i.onload = () => { loaded++; };
+  img[n] = i;
+});
+
+// map: 30 rows x 90 cols. y from top. viewport shows 30 x 16.875, we use 30x17-ish of 540/32=16.875
+const COLS = 96;
+const ROWS = 17; // 17*32 = 544 ~ 540
+const SOLID = 1, BRICK = 2, PLAT = 3, STEP = 4;
+
+function emptyMap() {
+  const m = [];
+  for (let y = 0; y < ROWS; y++) {
+    const row = new Array(COLS).fill(0);
+    m.push(row);
+  }
+  for (let x = 0; x < COLS; x++) {
+    m[ROWS - 1][x] = SOLID;
+    m[ROWS - 2][x] = SOLID;
+  }
+  // pits, two tiles wide so a standing jump clears them
+  for (const [a, b] of [[22, 23], [48, 49], [66, 67]]) {
+    for (let x = a; x <= b; x++) {
+      m[ROWS - 1][x] = 0;
+      m[ROWS - 2][x] = 0;
+    }
+  }
+  // platforms
+  function plat(x, y, len) {
+    for (let i = 0; i < len; i++) if (x + i < COLS) m[y][x + i] = PLAT;
+  }
+  function brick(x, y, w, h) {
+    for (let yy = 0; yy < h; yy++)
+      for (let xx = 0; xx < w; xx++)
+        if (y + yy < ROWS && x + xx < COLS) m[y + yy][x + xx] = BRICK;
+  }
+  plat(8, 12, 4);
+  plat(14, 10, 3);
+  plat(24, 11, 5);
+  plat(33, 9, 4);
+  plat(46, 11, 5);
+  plat(54, 8, 4);
+  plat(70, 11, 6);
+  // low bricks were blocking the ground path; keep the ground clear
+  // boss arena walls
+  for (let y = 8; y < ROWS - 2; y++) m[y][88] = BRICK;
+  return m;
+}
+
+const map = emptyMap();
+
+const player = {
+  x: 80, y: 300, vx: 0, vy: 0,
+  w: 36, h: 32,
+  face: 1,
+  onGround: false,
+  hp: 5, maxHp: 5,
+  hurt: 0, inv: 0,
+  shootCd: 0,
+  anim: 0,
+  dead: false,
+};
+
+const bullets = [];
+const ebullets = [];
+const enemies = [];
+const pickups = [];
+const particles = [];
+
+function spawnLevel() {
+  enemies.length = 0;
+  bullets.length = 0;
+  ebullets.length = 0;
+  pickups.length = 0;
+  const slimes = [340, 560, 980, 1200, 1560, 1780, 2060, 2280];
+  slimes.forEach((x, i) => enemies.push(makeSlime(x, 448, i % 2 ? 40 : 70)));
+  enemies.push(makeBat(700, 180));
+  enemies.push(makeBat(1280, 140));
+  enemies.push(makeBat(1900, 200));
+  enemies.push(makeBat(2500, 120));
+  enemies.push(makeBoss(2760, 280));
+  pickups.push({ x: 460, y: 280, t: "milk" });
+  pickups.push({ x: 1680, y: 300, t: "milk" });
+  pickups.push({ x: 2140, y: 210, t: "milk" });
+}
+
+function makeSlime(x, y, patrol) {
+  return { kind: "slime", x, y, w: 26, h: 20, vx: -0.6, hp: 2, dir: -1, origin: x, patrol, hurt: 0, dead: false };
+}
+function makeBat(x, y) {
+  return { kind: "bat", x, y, w: 30, h: 16, vx: -1.1, hp: 2, baseY: y, t: Math.random() * 6, hurt: 0, dead: false, frame: 0 };
+}
+function makeBoss(x, y) {
+  return {
+    kind: "boss", x, y, w: 86, h: 60, vx: -0.7, hp: 28, maxHp: 28,
+    hurt: 0, dead: false, phase: 0, shoot: 90, hop: 0, dir: -1, active: false
+  };
+}
+
+spawnLevel();
+
+let camX = 0;
+let time = 0;
+let state = "title"; // title play win lose
+let shootFlash = 0;
+
+function tileAt(tx, ty) {
+  if (ty < 0 || ty >= ROWS || tx < 0 || tx >= COLS) return 0;
+  return map[ty][tx];
+}
+function solidAt(tx, ty) {
+  const t = tileAt(tx, ty);
+  return t === SOLID || t === BRICK;
+}
+
+function rectHitsSolid(x, y, w, h, dy) {
+  const x0 = Math.floor(x / TILE);
+  const x1 = Math.floor((x + w - 1) / TILE);
+  const y0 = Math.floor(y / TILE);
+  const y1 = Math.floor((y + h - 1) / TILE);
+  for (let ty = y0; ty <= y1; ty++) {
+    for (let tx = x0; tx <= x1; tx++) {
+      const t = tileAt(tx, ty);
+      if (t === SOLID || t === BRICK) return true;
+      if (t === STEP && dy >= 0) {
+        const top = ty * TILE + 24;
+        const feet = y + h;
+        if (feet >= top - 1 && feet - Math.max(dy, 0) <= top + 8) return true;
+      }
+      if (t === PLAT && dy > 0) {
+        const top = ty * TILE;
+        const feet = y + h;
+        if (feet - dy <= top + 6 && feet >= top) return true;
+      }
+    }
+  }
+  return false;
+}
+
+function overlap(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+function damagePlayer(n) {
+  if (player.inv > 0 || player.dead || state !== "play") return;
+  player.hp -= n;
+  player.inv = 70;
+  player.hurt = 18;
+  player.vy = -5;
+  player.vx = -player.face * 3;
+  if (player.hp <= 0) {
+    player.hp = 0;
+    player.dead = true;
+    state = "lose";
+  }
+}
+
+function addBurst(x, y, color, n = 6) {
+  for (let i = 0; i < n; i++) {
+    particles.push({
+      x, y,
+      vx: (Math.random() - 0.5) * 3,
+      vy: (Math.random() - 1.2) * 2,
+      life: 18 + Math.random() * 12,
+      color
+    });
+  }
+}
+
+function shoot() {
+  if (player.shootCd > 0 || player.dead || state !== "play") return;
+  player.shootCd = 14;
+  shootFlash = 8;
+  const bx = player.face > 0 ? player.x + player.w - 4 : player.x - 6;
+  bullets.push({ x: bx, y: player.y + 12, vx: player.face * 7.2, w: 10, h: 8, life: 70 });
+}
+
+function bossShoot(b) {
+  const fast = b.hp < b.maxHp * 0.45;
+  const speeds = fast ? [-2.2, -1.1, 0, 1.1] : [-1.5, 0, 1.5];
+  speeds.forEach(vy => {
+    ebullets.push({
+      x: b.x - 4,
+      y: b.y + 26,
+      vx: -(fast ? 3.5 : 2.7),
+      vy,
+      w: 12, h: 12
+    });
+  });
+}
+
+function reset() {
+  player.x = 80; player.y = 300; player.vx = 0; player.vy = 0;
+  player.hp = player.maxHp; player.dead = false; player.inv = 0; player.face = 1;
+  camX = 0;
+  spawnLevel();
+  state = "play";
+}
+
+window.addEventListener("keydown", e => {
+  keys[e.code] = true;
+  if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space"].includes(e.code)) e.preventDefault();
+  if (state !== "play" && (e.code === "Enter" || e.code === "Space" || e.code === "KeyJ")) reset();
+  if (state === "play" && (e.code === "KeyJ" || e.code === "KeyK" || e.code === "KeyZ")) shoot();
+});
+window.addEventListener("keyup", e => { keys[e.code] = false; });
+
+function bindHold(el, prop, fire) {
+  const down = e => { e.preventDefault(); hold[prop] = true; if (fire) shoot(); if (state !== "play") reset(); };
+  const up = e => { e.preventDefault(); hold[prop] = false; };
+  el.addEventListener("pointerdown", down);
+  el.addEventListener("pointerup", up);
+  el.addEventListener("pointerleave", up);
+  el.addEventListener("pointercancel", up);
+}
+bindHold(document.getElementById("btnL"), "left");
+bindHold(document.getElementById("btnR"), "right");
+bindHold(document.getElementById("btnJ"), "jump");
+bindHold(document.getElementById("btnF"), "fire", true);
+
+let jumpQueued = false;
+window.addEventListener("keydown", e => {
+  if (e.code === "Space" || e.code === "ArrowUp" || e.code === "KeyW") jumpQueued = true;
+});
+
+function update() {
+  time++;
+  if (state !== "play") return;
+
+  const left = keys["ArrowLeft"] || keys["KeyA"] || hold.left;
+  const right = keys["ArrowRight"] || keys["KeyD"] || hold.right;
+  const jump = keys["Space"] || keys["ArrowUp"] || keys["KeyW"] || hold.jump;
+  const fireHeld = keys["KeyJ"] || keys["KeyK"] || keys["KeyZ"] || hold.fire;
+
+  if (left) { player.vx = -2.4; player.face = -1; }
+  else if (right) { player.vx = 2.4; player.face = 1; }
+  else player.vx *= 0.7;
+
+  if ((jump || jumpQueued) && player.onGround) {
+    player.vy = -10.2;
+    player.onGround = false;
+  }
+  jumpQueued = false;
+  if (!jump && player.vy < -4) player.vy *= 0.82;
+
+  player.vy += 0.34;
+  if (player.vy > 9) player.vy = 9;
+
+  // move x
+  player.x += player.vx;
+  if (rectHitsSolid(player.x, player.y, player.w, player.h, 0)) {
+    player.x -= player.vx;
+    const step = Math.sign(player.vx) || 1;
+    while (rectHitsSolid(player.x, player.y, player.w, player.h, 0)) player.x -= step;
+    player.vx = 0;
+  }
+  // move y
+  const prevY = player.y;
+  player.y += player.vy;
+  player.onGround = false;
+  if (rectHitsSolid(player.x, player.y, player.w, player.h, player.vy)) {
+    player.y = prevY;
+    if (player.vy > 0) {
+      // snap down to surface
+      while (!rectHitsSolid(player.x, player.y + 1, player.w, player.h, 1)) {
+        player.y += 1;
+        if (player.y > prevY + player.vy + 2) break;
+      }
+      player.onGround = true;
+    } else {
+      while (rectHitsSolid(player.x, player.y, player.w, player.h, -1)) player.y += 1;
+    }
+    player.vy = 0;
+  }
+
+  if (player.x < 0) player.x = 0;
+  if (player.y > H + 80) damagePlayer(99);
+
+  if (player.shootCd > 0) player.shootCd--;
+  if (player.inv > 0) player.inv--;
+  if (player.hurt > 0) player.hurt--;
+  if (shootFlash > 0) shootFlash--;
+  if (fireHeld) shoot();
+  player.anim++;
+
+  const maxCam = COLS * TILE - W;
+  const target = player.x - 280;
+  camX += (Math.max(0, Math.min(maxCam, target)) - camX) * 0.12;
+
+  // bullets
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    b.x += b.vx;
+    b.life--;
+    let hit = false;
+    if (rectHitsSolid(b.x, b.y, b.w, b.h, 0) || b.life <= 0 || b.x < camX - 40 || b.x > camX + W + 40) hit = true;
+    for (const e of enemies) {
+      if (e.dead) continue;
+      if (overlap(b, e)) {
+        e.hp--;
+        e.hurt = 8;
+        addBurst(b.x, b.y, e.kind === "boss" ? "#ffd24a" : "#b6ff9a", 5);
+        if (e.hp <= 0) {
+          e.dead = true;
+          addBurst(e.x + e.w / 2, e.y + e.h / 2, "#fff", 10);
+          if (e.kind === "boss") state = "win";
+        }
+        hit = true;
+        break;
+      }
+    }
+    if (hit) bullets.splice(i, 1);
+  }
+
+  for (let i = ebullets.length - 1; i >= 0; i--) {
+    const b = ebullets[i];
+    b.x += b.vx;
+    b.y += b.vy;
+    if (overlap(b, player)) {
+      damagePlayer(1);
+      ebullets.splice(i, 1);
+      continue;
+    }
+    if (b.x < camX - 60 || b.x > camX + W + 60 || b.y > H || rectHitsSolid(b.x, b.y, b.w, b.h, 0)) {
+      ebullets.splice(i, 1);
+    }
+  }
+
+  for (const e of enemies) {
+    if (e.dead) continue;
+    if (e.hurt > 0) e.hurt--;
+    if (e.kind === "slime") {
+      e.x += e.vx;
+      const ahead = e.x + (e.vx < 0 ? -1 : e.w + 1);
+      const foot = e.y + e.h + 2;
+      const tx = Math.floor(ahead / TILE);
+      const ty = Math.floor(e.y / TILE);
+      const tyb = Math.floor(foot / TILE);
+      const wall = solidAt(tx, ty) || tileAt(tx, ty) === BRICK;
+      const gap = !solidAt(Math.floor(e.x / TILE), tyb) && !solidAt(tx, tyb) && tileAt(tx, tyb) !== SOLID;
+      if (e.x < e.origin - e.patrol || e.x > e.origin + e.patrol || wall || tileAt(tx, Math.floor((e.y + e.h) / TILE)) === 0 && !solidAt(tx, tyb)) {
+        e.vx *= -1;
+      }
+      if (overlap(e, player)) damagePlayer(1);
+    } else if (e.kind === "bat") {
+      e.t += 0.05;
+      e.frame = Math.floor(time / 8) % 2;
+      e.x += e.vx;
+      e.y = e.baseY + Math.sin(e.t) * 28;
+      if (!e.minX) { e.minX = e.x - 90; e.maxX = e.x + 90; }
+      if (e.x < e.minX || e.x > e.maxX) e.vx *= -1;
+      if (overlap(e, player)) damagePlayer(1);
+    } else if (e.kind === "boss") {
+      if (player.x > e.x - 520) e.active = true;
+      if (!e.active) continue;
+      e.dir = -1;
+      e.x += (2820 - e.x) * 0.08;
+      e.x += Math.sin(time * 0.04) * (e.hp < e.maxHp * 0.45 ? 1.2 : 0.4);
+      e.hop++;
+      if (e.hop > (e.hp < e.maxHp * 0.45 ? 70 : 110)) {
+        e.vy = e.vy || -7;
+        e.hop = 0;
+      }
+      e.vy = (e.vy || 0) + 0.35;
+      e.y += e.vy;
+      const floor = (ROWS - 2) * TILE - e.h;
+      if (e.y >= floor) { e.y = floor; e.vy = 0; }
+      e.shoot--;
+      if (e.shoot <= 0) {
+        bossShoot(e);
+        e.shoot = e.hp < e.maxHp * 0.45 ? 42 : 78;
+      }
+      if (overlap(e, player)) damagePlayer(1);
+    }
+  }
+
+  for (let i = pickups.length - 1; i >= 0; i--) {
+    const p = pickups[i];
+    p.y += Math.sin(time * 0.08 + p.x) * 0.15;
+    if (overlap({ x: p.x, y: p.y, w: 16, h: 20 }, player)) {
+      player.hp = Math.min(player.maxHp, player.hp + 2);
+      addBurst(p.x, p.y, "#fff", 8);
+      pickups.splice(i, 1);
+    }
+  }
+
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx; p.y += p.vy; p.vy += 0.1; p.life--;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+
+function drawSprite(image, x, y, flip, dw, dh) {
+  if (!image) return;
+  const w = dw || image.width;
+  const h = dh || image.height;
+  ctx.save();
+  if (flip) {
+    ctx.translate(Math.round(x + w), Math.round(y));
+    ctx.scale(-1, 1);
+    ctx.drawImage(image, 0, 0, w, h);
+  } else {
+    ctx.drawImage(image, Math.round(x), Math.round(y), w, h);
+  }
+  ctx.restore();
+}
+
+function draw() {
+  ctx.imageSmoothingEnabled = false;
+  // sky
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#8fd3f5");
+  g.addColorStop(1, "#d7f3c2");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  // clouds parallax
+  for (let i = 0; i < 8; i++) {
+    const cx = ((i * 220 - camX * 0.25) % (W + 200) + (W + 200)) % (W + 200) - 80;
+    const cy = 30 + (i % 3) * 28;
+    ctx.drawImage(img.cloud, cx, cy);
+  }
+  // hills
+  ctx.fillStyle = "#7ec36a";
+  for (let i = 0; i < 6; i++) {
+    const hx = ((i * 280 - camX * 0.45) % (W + 240) + W + 240) % (W + 240) - 100;
+    ctx.beginPath();
+    ctx.arc(hx, H - 40, 90, Math.PI, 0);
+    ctx.fill();
+  }
+
+  ctx.save();
+  ctx.translate(-Math.round(camX), 0);
+
+  for (let ty = 0; ty < ROWS; ty++) {
+    const x0 = Math.max(0, Math.floor(camX / TILE) - 1);
+    const x1 = Math.min(COLS - 1, Math.floor((camX + W) / TILE) + 1);
+    for (let tx = x0; tx <= x1; tx++) {
+      const t = map[ty][tx];
+      if (t === SOLID) ctx.drawImage(img.ground, tx * TILE, ty * TILE);
+      else if (t === BRICK) ctx.drawImage(img.brick, tx * TILE, ty * TILE);
+      else if (t === PLAT) ctx.drawImage(img.plat, tx * TILE, ty * TILE);
+      else if (t === STEP) ctx.drawImage(img.brick, 0, 16, 32, 16, tx * TILE, ty * TILE + 24, 32, 8);
+    }
+  }
+
+  // pit water hint
+  ctx.fillStyle = "rgba(50,140,190,0.55)";
+  for (const [a, b] of [[22, 23], [48, 49], [66, 67]]) {
+    ctx.fillRect(a * TILE, (ROWS - 2) * TILE + 10, (b - a + 1) * TILE, TILE * 2);
+  }
+
+  for (const p of pickups) ctx.drawImage(img.milk, Math.round(p.x), Math.round(p.y));
+
+  for (const e of enemies) {
+    if (e.dead) continue;
+    if (e.hurt > 0 && Math.floor(time / 2) % 2 === 0) continue;
+    if (e.kind === "slime") drawSprite(img.slime, e.x, e.y, e.vx > 0);
+    else if (e.kind === "bat") drawSprite(e.frame ? img.bat1 : img.bat0, e.x, e.y, e.vx > 0);
+    else {
+      drawSprite(img.boss, e.x, e.y, e.dir > 0, e.w, e.h);
+      // boss bar
+      if (e.active) {
+        ctx.fillStyle = "#1b140e";
+        ctx.fillRect(e.x, e.y - 12, e.w, 6);
+        ctx.fillStyle = "#ef4b4b";
+        ctx.fillRect(e.x + 1, e.y - 11, (e.w - 2) * (e.hp / e.maxHp), 4);
+      }
+    }
+  }
+
+  for (const b of bullets) ctx.drawImage(img.bullet, Math.round(b.x), Math.round(b.y));
+  for (const b of ebullets) ctx.drawImage(img.boss_bullet, Math.round(b.x), Math.round(b.y));
+
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(0, p.life / 24);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x, p.y, 3, 3);
+    ctx.globalAlpha = 1;
+  }
+
+  if (!(player.inv > 0 && Math.floor(time / 3) % 2 === 0)) {
+    let spr = img.frog_idle;
+    if (player.hurt > 0) spr = img.frog_hurt;
+    else if (shootFlash > 0) spr = img.frog_shoot;
+    else if (!player.onGround) spr = img.frog_walk;
+    else if (Math.abs(player.vx) > 0.4) spr = (Math.floor(player.anim / 6) % 2) ? img.frog_walk : img.frog_idle;
+    drawSprite(spr, player.x - 6, player.y - 4, player.face < 0, 48, 40);
+  }
+
+  ctx.restore();
+
+  // HUD
+  for (let i = 0; i < player.maxHp; i++) {
+    ctx.globalAlpha = i < player.hp ? 1 : 0.25;
+    ctx.drawImage(img.heart, 16 + i * 18, 14, 16, 14);
+  }
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = "#1b140e";
+  ctx.font = "bold 16px sans-serif";
+  ctx.fillText("奶蛙", 16, 48);
+
+  const boss = enemies.find(e => e.kind === "boss" && !e.dead && e.active);
+  if (boss && state === "play") {
+    ctx.fillStyle = "#1b140e";
+    ctx.fillRect(W / 2 - 160, 16, 320, 16);
+    ctx.fillStyle = "#f0c14e";
+    ctx.fillRect(W / 2 - 158, 18, 316 * (boss.hp / boss.maxHp), 12);
+    ctx.fillStyle = "#1b140e";
+    ctx.font = "bold 14px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("大王蛙", W / 2, 46);
+    ctx.textAlign = "left";
+  }
+
+  if (state !== "play") {
+    ctx.fillStyle = "rgba(16,14,20,0.45)";
+    ctx.fillRect(0, H / 2 - 110, W, 190);
+    ctx.fillStyle = "#fff8e8";
+    ctx.textAlign = "center";
+    ctx.font = "bold 48px sans-serif";
+    const title = state === "title" ? "奶蛙闯关" : state === "win" ? "大王蛙倒下了" : "奶蛙摔倒了";
+    ctx.fillText(title, W / 2, H / 2 - 30);
+    ctx.font = "20px sans-serif";
+    ctx.fillText(state === "title" ? "越过水坑，打倒小怪，击败大王蛙" : "再来一次", W / 2, H / 2 + 16);
+    ctx.font = "16px sans-serif";
+    ctx.fillStyle = "#ffe08a";
+    ctx.fillText("按空格 / 回车，或点屏幕按钮开始", W / 2, H / 2 + 52);
+    ctx.textAlign = "left";
+  }
+}
+
+function loop() {
+  if (loaded >= names.length - 2) {
+    update();
+    draw();
+  }
+  requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+</html>
