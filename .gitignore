@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+shot.png
+shot2.png
+_sim*.js
+_g.js
+sim.js
+sim.html
